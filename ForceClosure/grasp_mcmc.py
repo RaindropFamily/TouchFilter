@@ -152,24 +152,39 @@ stepsize_history = []
 grad_ema = EMA(args.mu)
 grad_ema.apply(grad)
 
+directly_update_contact_points_flag = torch.zeros(size=[args.batch_size], device='cuda')
+directly_update_contact_points = torch.zeros(size=[args.batch_size], device='cuda').bool()
+
 # mcmc
+langevin_possibility = 0.85
+update_contact_pts_threshold = 5
+
 for _iter in range(args.n_iter):
   # 50/50 chance of updating z or contact point
   rand = random.random()
   step_size = S(_iter)
   temperature = T(_iter)
-  if rand < 0.5:
+  directly_update_contact_points = directly_update_contact_points_flag > update_contact_pts_threshold
+  new_z = torch.zeros(size=z.shape, device='cuda').float()
+  new_contact_point_indices = contact_point_indices.clone()
+  if rand < langevin_possibility:
     # update z using matropolis-hasting langevin
     noise = torch.normal(mean=0, std=1, size=z.shape, device='cuda').float() * step_size
     new_z = z - 0.5 * grad / grad_ema.average.unsqueeze(0) * step_size * step_size + noise
     new_contact_point_indices = contact_point_indices
   else:
-    # update contact point
-    update_indices = torch.randint(0, 3, size=[args.batch_size], device='cuda')
-    update_to = torch.randint(0, hand_model.num_points, size=[args.batch_size], device='cuda')
-    new_contact_point_indices = contact_point_indices.clone()
-    new_contact_point_indices[torch.arange(args.batch_size), update_indices] = update_to
-    new_z = z
+    # all contact points are to be changed, if contact points for i changed, new_z[i] should be same as z[i]
+    # refresh update_flag
+    directly_update_contact_points = torch.ones(size=[args.batch_size], device='cuda').bool()
+    directly_update_contact_points_flag = torch.zeros(size=[args.batch_size], device='cuda')
+  # update contact point
+  update_indices = torch.randint(0, 3, size=[args.batch_size], device='cuda')
+  update_to = torch.randint(0, hand_model.num_points, size=[args.batch_size], device='cuda')
+  temp_new_contact_point_indices = contact_point_indices.clone()
+  temp_new_contact_point_indices[torch.arange(args.batch_size), update_indices] = update_to
+  new_contact_point_indices[directly_update_contact_points] = temp_new_contact_point_indices[directly_update_contact_points]
+  new_z[directly_update_contact_points] = z[directly_update_contact_points]
+  
   # compute new energy
   new_energy = compute_energy(obj_code, new_z, new_contact_point_indices)
   new_grad = torch.autograd.grad(new_energy.sum(), new_z)[0]
@@ -177,6 +192,7 @@ for _iter in range(args.n_iter):
     # metropolis-hasting
     alpha = torch.rand(args.batch_size, device='cuda').float()
     accept = alpha < torch.exp((energy - new_energy) / temperature)
+    directly_update_contact_points_flag[~accept] += 1
     z[accept] = new_z[accept]
     contact_point_indices[accept] = new_contact_point_indices[accept]
     energy[accept] = new_energy[accept]
